@@ -1,21 +1,26 @@
 import uuid
+import os
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-
 from PyPDF2 import PdfReader
 import docx
 from fastapi.responses import Response
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from io import BytesIO
-
+from groq import Groq
 
 app = FastAPI()
 
+# --- Groq setup ---
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+client = Groq(api_key=GROQ_API_KEY)
+groq_model = "llama-3.1-8b-instant"
+
 # In-memory storage
-documents = {}            
-document_text = {}        
-document_chunks = {}      
-sessions = {}             # session_id -> conversation history
+documents = {}
+document_text = {}
+document_chunks = {}
+sessions = {}  # session_id -> conversation history
 
 
 @app.get("/health")
@@ -71,10 +76,8 @@ def extract_text_and_chunk(document_id: str, file: UploadFile):
 
 
 @app.post("/upload", status_code=202)
-def upload_document(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
-):
+def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+
     if not file.filename.lower().endswith((".pdf", ".txt", ".docx")):
         raise HTTPException(status_code=400, detail="Unsupported file type")
 
@@ -92,6 +95,7 @@ def upload_document(
 
 @app.get("/documents/{document_id}/status")
 def get_document_status(document_id: str):
+
     if document_id not in documents:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -103,6 +107,7 @@ def get_document_status(document_id: str):
 
 @app.get("/documents/{document_id}/chunks")
 def get_document_chunks(document_id: str):
+
     if document_id not in document_chunks:
         raise HTTPException(status_code=404, detail="Chunks not found")
 
@@ -114,6 +119,7 @@ def get_document_chunks(document_id: str):
 
 @app.post("/ask")
 def ask_question(payload: dict):
+
     session_id = payload.get("session_id") or str(uuid.uuid4())
     document_ids = payload.get("document_ids", [])
     question = payload.get("question")
@@ -121,17 +127,17 @@ def ask_question(payload: dict):
     if not question or not document_ids:
         raise HTTPException(status_code=400, detail="Invalid request")
 
-    # Initialize session if new
+    # Initialize session
     if session_id not in sessions:
         sessions[session_id] = []
 
-    # Save user question
+    # Save user message
     sessions[session_id].append({
         "role": "user",
         "content": question
     })
 
-    # Mock retrieval: take first 2 chunks
+    # Retrieve first chunks
     source_chunks = []
     for doc_id in document_ids:
         chunks = document_chunks.get(doc_id, [])
@@ -142,9 +148,35 @@ def ask_question(payload: dict):
                 "text": chunk["text"]
             })
 
-    answer = "This is a mock answer generated from the document content."
+    # Build prompt
+    chunks_text = "\n\n".join(chunk["text"] for chunk in source_chunks)
 
-    # Save assistant answer
+    prompt = (
+        "You are a helpful assistant. Answer the question only using the "
+        "provided document text.\n\n"
+        f"Document context:\n{chunks_text}\n\n"
+        f"Question:\n{question}\n\n"
+        "If the answer is not in the document, say you cannot find it."
+    )
+
+    # Call Groq API
+    try:
+        response = client.chat.completions.create(
+            model=groq_model,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1024
+        )
+
+        answer = response.choices[0].message.content
+
+    except Exception as e:
+        print(f"[Groq Error] {type(e).__name__}: {e}")
+        answer = "This is a mock answer generated from the document content."
+
+    # Save assistant response
     sessions[session_id].append({
         "role": "assistant",
         "content": answer
@@ -156,8 +188,11 @@ def ask_question(payload: dict):
         "source_chunks": source_chunks,
         "batch_size": len(source_chunks)
     }
+
+
 @app.get("/session/{session_id}")
 def get_session_history(session_id: str):
+
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -169,6 +204,7 @@ def get_session_history(session_id: str):
 
 @app.get("/session/{session_id}/export")
 def export_session_pdf(session_id: str):
+
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
